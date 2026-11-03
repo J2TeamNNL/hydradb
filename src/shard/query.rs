@@ -10282,7 +10282,8 @@ fn source_relationship_id_projection_supported(
                 edge.src.binding.as_deref() == Some(binding.as_str())
                     || edge.dst.binding.as_deref() == Some(binding.as_str())
             }
-            RowProjection::Property { .. }
+            RowProjection::Entity { .. }
+            | RowProjection::Property { .. }
             | RowProjection::CountAll
             | RowProjection::Literal(_)
             | RowProjection::Aggregate { .. } => false,
@@ -10310,12 +10311,15 @@ fn source_relationship_id_order_supported(
                     edge.src.binding.as_deref() == Some(binding.as_str())
                         || edge.dst.binding.as_deref() == Some(binding.as_str())
                 }
-                RowProjection::Property { .. }
+                RowProjection::Entity { .. }
+                | RowProjection::Property { .. }
                 | RowProjection::CountAll
                 | RowProjection::Literal(_)
                 | RowProjection::Aggregate { .. } => false,
             }),
-        RowSortExpression::Property { .. } | RowSortExpression::CountAll => false,
+        RowSortExpression::ElementId { .. }
+        | RowSortExpression::Property { .. }
+        | RowSortExpression::CountAll => false,
     })
 }
 
@@ -10343,7 +10347,9 @@ fn source_relationship_id_page_order(
                         if edge.dst.binding.as_deref() == Some(binding.as_str())
                 )
             }),
-        RowSortExpression::Property { .. } | RowSortExpression::CountAll => false,
+        RowSortExpression::ElementId { .. }
+        | RowSortExpression::Property { .. }
+        | RowSortExpression::CountAll => false,
     };
     orders_destination.then_some(sort.ascending)
 }
@@ -10461,6 +10467,7 @@ fn ordered_relationship_property_index_spec(
                     property.as_str()
                 }
                 RowProjection::NodeId { .. }
+                | RowProjection::Entity { .. }
                 | RowProjection::Property { .. }
                 | RowProjection::CountAll
                 | RowProjection::Literal(_)
@@ -10468,6 +10475,7 @@ fn ordered_relationship_property_index_spec(
             }
         }
         RowSortExpression::NodeId { .. }
+        | RowSortExpression::ElementId { .. }
         | RowSortExpression::Property { .. }
         | RowSortExpression::CountAll => return None,
     };
@@ -10496,9 +10504,10 @@ fn relationship_rows_projection_supported(
         RowProjection::Property { binding, property } => {
             edge.binding.as_deref() == Some(binding.as_str()) && property != "id"
         }
-        RowProjection::CountAll | RowProjection::Literal(_) | RowProjection::Aggregate { .. } => {
-            false
-        }
+        RowProjection::Entity { .. }
+        | RowProjection::CountAll
+        | RowProjection::Literal(_)
+        | RowProjection::Aggregate { .. } => false,
     })
 }
 
@@ -10529,11 +10538,12 @@ fn relationship_rows_order_supported(
                 RowProjection::Property { binding, property } => {
                     edge.binding.as_deref() == Some(binding.as_str()) && property != "id"
                 }
-                RowProjection::CountAll
+                RowProjection::Entity { .. }
+                | RowProjection::CountAll
                 | RowProjection::Literal(_)
                 | RowProjection::Aggregate { .. } => false,
             }),
-        RowSortExpression::CountAll => false,
+        RowSortExpression::ElementId { .. } | RowSortExpression::CountAll => false,
     })
 }
 
@@ -10574,7 +10584,8 @@ fn graph_kernel_projection(
             }
         }
         RowProjection::CountAll => Some(GraphKernelProjection::CountAll),
-        RowProjection::Property { .. }
+        RowProjection::Entity { .. }
+        | RowProjection::Property { .. }
         | RowProjection::Literal(_)
         | RowProjection::Aggregate { .. } => None,
     }
@@ -10614,7 +10625,9 @@ fn graph_kernel_order_supported(
                     _ => None,
                 }
             }
-            RowSortExpression::Property { .. } | RowSortExpression::CountAll => None,
+            RowSortExpression::ElementId { .. }
+            | RowSortExpression::Property { .. }
+            | RowSortExpression::CountAll => None,
         },
         GraphKernelProjection::CountAll => match &sort.expression {
             RowSortExpression::CountAll => Some(true),
@@ -10625,7 +10638,9 @@ fn graph_kernel_order_supported(
                     None
                 }
             }
-            RowSortExpression::NodeId { .. } | RowSortExpression::Property { .. } => None,
+            RowSortExpression::NodeId { .. }
+            | RowSortExpression::ElementId { .. }
+            | RowSortExpression::Property { .. } => None,
         },
     }
 }
@@ -10676,7 +10691,9 @@ fn streaming_neighbor_order_supported(
             }
             None => false,
         },
-        RowSortExpression::Property { .. } | RowSortExpression::CountAll => false,
+        RowSortExpression::ElementId { .. }
+        | RowSortExpression::Property { .. }
+        | RowSortExpression::CountAll => false,
     }
 }
 
@@ -12326,10 +12343,96 @@ fn binding_property(
 }
 
 #[cfg(feature = "opencypher")]
+fn entity_projection_error(feature: impl Into<String>) -> GraphError {
+    GraphError::UnsupportedQuery {
+        reason: QueryFailureReason::Return,
+        dialect: "OpenCypher",
+        feature: feature.into(),
+    }
+}
+
+#[cfg(feature = "opencypher")]
+fn project_entity_value(
+    row: &BindingRow,
+    binding: &str,
+    function: &RowEntityFunction,
+) -> Result<QueryValue> {
+    use crate::query::algebra::{QueryPathNode, QueryPathRelationship};
+    if row.null_values.contains(binding) || row.null_relationships.contains(binding) {
+        return Ok(QueryValue::Null);
+    }
+    if let Some(relationship) = row.relationships.get(binding) {
+        let metadata = row.relationship_metadata.get(relationship).ok_or_else(|| {
+            entity_projection_error(format!(
+                "relationship metadata for {binding} was not hydrated"
+            ))
+        })?;
+        let entity = QueryPathRelationship {
+            id: relationship.relationship_id,
+            edge_type: relationship.edge_type.clone(),
+            src: relationship.src,
+            dst: relationship.dst,
+            properties: metadata.properties.clone(),
+        };
+        return match function {
+            RowEntityFunction::Value => Ok(QueryValue::Relationship(Box::new(entity))),
+            RowEntityFunction::ElementId => Ok(QueryValue::Property(VertexPropertyValue::String(
+                entity.element_id(),
+            ))),
+            RowEntityFunction::Id => {
+                entity
+                    .id
+                    .map(QueryValue::VertexId)
+                    .ok_or_else(|| {
+                        GraphError::UnsupportedQuery {
+                    reason: QueryFailureReason::Return,
+                    dialect: "OpenCypher",
+                    feature:
+                        "id() has no numeric identity for structural relationships; use elementId()"
+                            .into(),
+                }
+                    })
+            }
+            RowEntityFunction::Labels => Err(GraphError::UnsupportedQuery {
+                reason: QueryFailureReason::Return,
+                dialect: "OpenCypher",
+                feature: "labels() requires a node".into(),
+            }),
+        };
+    }
+    let id = row.get(binding)?;
+    let metadata = row.metadata.get(binding).ok_or_else(|| {
+        entity_projection_error(format!("node metadata for {binding} was not hydrated"))
+    })?;
+    match function {
+        RowEntityFunction::Value => Ok(QueryValue::Node(Box::new(QueryPathNode {
+            id,
+            labels: metadata.labels.iter().cloned().collect(),
+            properties: metadata.properties.clone(),
+        }))),
+        RowEntityFunction::ElementId => Ok(QueryValue::Property(VertexPropertyValue::String(
+            id.to_string(),
+        ))),
+        RowEntityFunction::Id => Ok(QueryValue::VertexId(id)),
+        RowEntityFunction::Labels => Ok(QueryValue::List(
+            metadata
+                .labels
+                .iter()
+                .cloned()
+                .map(|label| QueryValue::Property(VertexPropertyValue::String(label)))
+                .collect(),
+        )),
+    }
+}
+
+#[cfg(feature = "opencypher")]
 fn project_binding_row(row: &BindingRow, projections: &[RowProjection]) -> Result<QueryRow> {
     let mut values = Vec::with_capacity(projections.len());
     for projection in projections {
         match projection {
+            RowProjection::Entity { binding, function } => {
+                values.push(project_entity_value(row, binding, function)?)
+            }
             RowProjection::NodeId { binding } => {
                 values.push(match row.get_optional(binding)? {
                     Some(value) => QueryValue::VertexId(value),
@@ -12371,6 +12474,11 @@ fn project_relationship_row(
     let mut values = Vec::with_capacity(projections.len());
     for projection in projections {
         values.push(match projection {
+            RowProjection::Entity { .. } => {
+                return Err(entity_projection_error(
+                    "entity projection requires hydrated bindings",
+                ))
+            }
             RowProjection::NodeId { binding } => {
                 QueryValue::VertexId(relationship_endpoint_id(edge, relationship, binding)?)
             }
@@ -12465,6 +12573,11 @@ fn sort_keys_for_relationship_row(
     let mut keys = Vec::with_capacity(query.order_by.len());
     for sort in &query.order_by {
         keys.push(match &sort.expression {
+            RowSortExpression::ElementId { .. } => {
+                return Err(entity_projection_error(
+                    "elementId sort requires hydrated bindings",
+                ))
+            }
             RowSortExpression::NodeId { binding } => {
                 QueryValue::VertexId(relationship_endpoint_id(edge, relationship, binding)?)
             }
@@ -12752,6 +12865,7 @@ fn project_single_binding_value(
     projection: &RowProjection,
 ) -> Result<QueryValue> {
     match projection {
+        RowProjection::Entity { binding, function } => project_entity_value(row, binding, function),
         RowProjection::NodeId { binding } => Ok(match row.get_optional(binding)? {
             Some(value) => QueryValue::VertexId(value),
             None => QueryValue::Null,
@@ -12802,6 +12916,9 @@ fn sort_keys_for_row(
     let mut keys = Vec::with_capacity(order_by.len());
     for sort in order_by {
         keys.push(match &sort.expression {
+            RowSortExpression::ElementId { binding } => {
+                project_entity_value(binding_row, binding, &RowEntityFunction::ElementId)?
+            }
             RowSortExpression::NodeId { binding } => match binding_row.get_optional(binding)? {
                 Some(value) => QueryValue::VertexId(value),
                 None => QueryValue::Null,
@@ -12856,7 +12973,7 @@ fn sort_keys_for_projected_only(
                     feature: "aggregate ORDER BY cannot reference row variables".to_string(),
                 });
             }
-            RowSortExpression::Property { .. } => {
+            RowSortExpression::ElementId { .. } | RowSortExpression::Property { .. } => {
                 return Err(GraphError::UnsupportedQuery {
                     reason: QueryFailureReason::OrderWindow,
                     dialect: "OpenCypher",
@@ -12943,6 +13060,8 @@ fn compare_query_values(left: &QueryValue, right: &QueryValue) -> std::cmp::Orde
             left.len().cmp(&right.len())
         }
         (QueryValue::Path(left), QueryValue::Path(right)) => left.cmp(right),
+        (QueryValue::Node(left), QueryValue::Node(right)) => left.cmp(right),
+        (QueryValue::Relationship(left), QueryValue::Relationship(right)) => left.cmp(right),
         (QueryValue::Bool(left), QueryValue::Bool(right)) => left.cmp(right),
         _ => query_value_rank(left).cmp(&query_value_rank(right)),
     }
@@ -12972,6 +13091,8 @@ fn query_value_rank(value: &QueryValue) -> u8 {
         QueryValue::Property(value) => 4 + vertex_property_rank(value),
         QueryValue::List(_) => 8,
         QueryValue::Path(_) => 9,
+        QueryValue::Node(_) => 10,
+        QueryValue::Relationship(_) => 11,
         QueryValue::Null => u8::MAX,
     }
 }
@@ -13140,5 +13261,272 @@ fn compare_u64_f64(left: u64, right: f64) -> std::cmp::Ordering {
         std::cmp::Ordering::Equal if floor == right => std::cmp::Ordering::Equal,
         std::cmp::Ordering::Equal => std::cmp::Ordering::Less,
         ordering => ordering,
+    }
+}
+
+#[cfg(all(test, feature = "opencypher"))]
+mod entity_row_tests {
+    use super::*;
+
+    async fn local_shard() -> (tempfile::TempDir, GraphShard) {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Arc::new(
+            slatedb::object_store::local::LocalFileSystem::new_with_prefix(directory.path())
+                .unwrap(),
+        );
+        let shard = GraphShard::open_standalone_writer_with_options(
+            "entity-row-tests",
+            store,
+            GraphOpenOptions::default(),
+        )
+        .await
+        .unwrap();
+        (directory, shard)
+    }
+
+    fn metadata(name: &str) -> VertexMetadata {
+        VertexMetadata {
+            labels: ["Person".to_string(), "Reader".to_string()]
+                .into_iter()
+                .collect(),
+            properties: [(
+                "name".to_string(),
+                VertexPropertyValue::String(name.to_string()),
+            )]
+            .into_iter()
+            .collect(),
+        }
+    }
+
+    async fn rows(shard: &GraphShard, query: &str) -> QueryResultSet {
+        shard
+            .execute_opencypher_rows(QueryContext::new("one", "entity-read"), query)
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn entity_nodes_are_hydrated_sorted_and_windowed() {
+        let (_directory, shard) = local_shard().await;
+        shard
+            .set_vertex_metadata("one", 1, metadata("Zoe"))
+            .await
+            .unwrap();
+        shard
+            .set_vertex_metadata("one", 2, metadata("Amy"))
+            .await
+            .unwrap();
+        let result = rows(
+            &shard,
+            "MATCH (n:Person) RETURN n, labels(n), elementId(n) ORDER BY n.name SKIP 1 LIMIT 1",
+        )
+        .await;
+        let QueryValue::Node(node) = &result.rows[0].values[0] else {
+            panic!("expected node")
+        };
+        assert_eq!(node.id, 1);
+        assert_eq!(node.labels, ["Person", "Reader"]);
+        assert_eq!(node.properties, metadata("Zoe").properties);
+        assert_eq!(
+            result.rows[0].values[1],
+            QueryValue::List(vec![
+                QueryValue::Property(VertexPropertyValue::String("Person".into())),
+                QueryValue::Property(VertexPropertyValue::String("Reader".into()))
+            ])
+        );
+        assert_eq!(
+            result.rows[0].values[2],
+            QueryValue::Property(VertexPropertyValue::String("1".into()))
+        );
+        let ordered = rows(
+            &shard,
+            "MATCH (n:Person) RETURN n ORDER BY elementId(n) DESC LIMIT 1",
+        )
+        .await;
+        assert!(matches!(&ordered.rows[0].values[0], QueryValue::Node(node) if node.id == 2));
+        let optional = rows(
+            &shard,
+            "MATCH (n:Person) OPTIONAL MATCH (missing:Absent) RETURN n, missing ORDER BY n.id",
+        )
+        .await;
+        assert_eq!(optional.rows.len(), 2);
+        assert!(optional
+            .rows
+            .iter()
+            .all(|row| row.values[1] == QueryValue::Null));
+        assert!(rows(&shard, "MATCH (n:Absent) RETURN n")
+            .await
+            .rows
+            .is_empty());
+        assert!(rows(&shard, "MATCH (n:Absent) RETURN 1")
+            .await
+            .rows
+            .is_empty());
+        assert!(shard
+            .execute_opencypher_rows(
+                QueryContext::new("one", "missing-entity"),
+                "MATCH (n {id: 99999}) RETURN n"
+            )
+            .await
+            .unwrap()
+            .rows
+            .is_empty());
+        shard
+            .set_vertex_metadata("one", 77, VertexMetadata::default())
+            .await
+            .unwrap();
+        let isolated = rows(&shard, "MATCH (n {id: 77}) RETURN n").await;
+        assert!(matches!(&isolated.rows[0].values[0], QueryValue::Node(node)
+            if node.id == 77 && node.labels.is_empty() && node.properties.is_empty()));
+        shard
+            .write_edge(EdgeMutation {
+                cell_id: "one".into(),
+                edge_type: "ANONYMOUS".into(),
+                src: 50,
+                dst: 51,
+                idempotency_key: "anonymous-endpoints".into(),
+            })
+            .await
+            .unwrap();
+        let endpoints = rows(&shard, "MATCH (a)-[:ANONYMOUS]->(b) RETURN a, b").await;
+        assert!(matches!(&endpoints.rows[0].values[0], QueryValue::Node(node) if node.id == 50));
+        assert!(matches!(&endpoints.rows[0].values[1], QueryValue::Node(node) if node.id == 51));
+        shard.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn entity_relationships_preserve_parallel_and_structural_identities() {
+        let (_directory, shard) = local_shard().await;
+        let mutation = |key: &str| EdgeMutation {
+            cell_id: "one".into(),
+            edge_type: "READS".into(),
+            src: 1,
+            dst: 2,
+            idempotency_key: key.into(),
+        };
+        shard.write_edge(mutation("structural")).await.unwrap();
+        let edge_metadata = EdgeMetadata {
+            properties: [("weight".into(), VertexPropertyValue::Integer(7))]
+                .into_iter()
+                .collect(),
+        };
+        // A property-free structural edge becomes topology backing identified
+        // relationships; its own properties keep it an independent relationship.
+        shard
+            .set_edge_metadata("one", "READS", 1, 2, edge_metadata.clone())
+            .await
+            .unwrap();
+        let first = shard
+            .create_relationship_with_full_metadata(
+                mutation("first"),
+                metadata("A"),
+                metadata("B"),
+                edge_metadata.clone(),
+            )
+            .await
+            .unwrap();
+        let second = shard
+            .create_relationship_with_full_metadata(
+                mutation("second"),
+                metadata("A"),
+                metadata("B"),
+                edge_metadata.clone(),
+            )
+            .await
+            .unwrap();
+        let result = rows(
+            &shard,
+            "MATCH ()-[r:READS]->() RETURN r, elementId(r) ORDER BY elementId(r)",
+        )
+        .await;
+        assert_eq!(result.rows.len(), 3);
+        let mut identities = BTreeSet::new();
+        for row in result.rows {
+            let QueryValue::Relationship(relationship) = &row.values[0] else {
+                panic!("expected relationship")
+            };
+            assert_eq!((relationship.src, relationship.dst), (1, 2));
+            assert_eq!(relationship.edge_type, "READS");
+            if relationship.id.is_some() {
+                assert_eq!(relationship.properties, edge_metadata.properties);
+            }
+            identities.insert(relationship.element_id());
+            assert_eq!(
+                row.values[1],
+                QueryValue::Property(VertexPropertyValue::String(relationship.element_id()))
+            );
+        }
+        assert!(identities.contains("structural:READS:1:2"));
+        assert!(identities.contains(&first.relationship_id.to_string()));
+        assert!(identities.contains(&second.relationship_id.to_string()));
+        assert_eq!(
+            rows(
+                &shard,
+                "MATCH ()-[r:READS]->() RETURN r ORDER BY elementId(r) SKIP 1 LIMIT 1"
+            )
+            .await
+            .rows
+            .len(),
+            1
+        );
+        shard.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn standalone_return_uses_one_seed_without_changing_empty_match_semantics() {
+        let (_directory, shard) = local_shard().await;
+        let result = rows(&shard, "RETURN 1 AS ping").await;
+        assert_eq!(
+            result.rows,
+            vec![QueryRow::new(vec![QueryValue::Property(
+                VertexPropertyValue::Integer(1)
+            )])]
+        );
+        let parameterized = shard
+            .execute_opencypher_rows(
+                QueryContext::new("one", "parameter-read")
+                    .with_parameter("value", VertexPropertyValue::Integer(42)),
+                "RETURN $value AS value",
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            parameterized.rows[0].values,
+            vec![QueryValue::Property(VertexPropertyValue::Integer(42))]
+        );
+        let rebound = shard
+            .execute_opencypher_rows(
+                QueryContext::new("one", "rebound-parameter")
+                    .with_parameter("value", VertexPropertyValue::Integer(99)),
+                "RETURN $value AS value",
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            rebound.rows[0].values,
+            vec![QueryValue::Property(VertexPropertyValue::Integer(99))]
+        );
+        let changed_parameter = shard
+            .execute_opencypher_rows(
+                QueryContext::new("one", "changed-parameter")
+                    .with_parameter("value", VertexPropertyValue::Integer(99)),
+                "RETURN $value",
+            )
+            .await
+            .unwrap();
+        assert_eq!(changed_parameter.columns, vec![QueryColumn::new("$value")]);
+        assert_eq!(
+            changed_parameter.rows[0].values,
+            vec![QueryValue::Property(VertexPropertyValue::Integer(99))]
+        );
+        assert!(rows(&shard, "RETURN 1 AS ping LIMIT 0")
+            .await
+            .rows
+            .is_empty());
+        assert!(rows(&shard, "MATCH (n:Absent) RETURN 1 AS ping")
+            .await
+            .rows
+            .is_empty());
+        shard.close().await.unwrap();
     }
 }

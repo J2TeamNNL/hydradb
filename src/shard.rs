@@ -9,6 +9,8 @@ mod graph_plan;
 mod lifecycle;
 mod maintenance;
 #[cfg(feature = "opencypher")]
+mod metadata_procedure;
+#[cfg(feature = "opencypher")]
 mod path_procedure;
 mod query;
 #[cfg(feature = "opencypher")]

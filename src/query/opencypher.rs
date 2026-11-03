@@ -267,6 +267,10 @@ pub struct RowNodePattern {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum RowProjection {
+    Entity {
+        binding: String,
+        function: RowEntityFunction,
+    },
     NodeId {
         binding: String,
     },
@@ -284,6 +288,14 @@ pub enum RowProjection {
     /// Inert for DISTINCT and ORDER BY: it cannot change which rows are
     /// distinct, and every row compares equal on it.
     Literal(Option<VertexPropertyValue>),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RowEntityFunction {
+    Value,
+    ElementId,
+    Labels,
+    Id,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -347,6 +359,7 @@ pub struct RowSort {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum RowSortExpression {
+    ElementId { binding: String },
     NodeId { binding: String },
     Property { binding: String, property: String },
     Column { name: String },
@@ -530,6 +543,9 @@ pub(crate) fn classify_opencypher_query_access(query: &str) -> Result<OpenCypher
 }
 
 fn classify_with_libcypher(query: &str) -> Result<OpenCypherQueryAccess> {
+    if super::path_procedure::parse_native_metadata_call(query)?.is_some() {
+        return Ok(OpenCypherQueryAccess::Read);
+    }
     if super::path_procedure::is_native_path_procedure(query) {
         return Ok(OpenCypherQueryAccess::Read);
     }
@@ -3088,7 +3104,7 @@ fn lower_row_query_clauses(
     parameters: &BTreeMap<String, VertexPropertyValue>,
     lists: &ListParameters,
 ) -> Result<ParsedRowQuery> {
-    if clauses.len() < 2 {
+    if clauses.is_empty() {
         return unsupported(
             QueryFailureReason::Other,
             "row execution supports MATCH ... RETURN queries",
@@ -3174,9 +3190,9 @@ fn validate_return_bindings(rows: &ParsedRowQuery, visible: &BTreeSet<String>) -
     };
     for projection in &rows.projections {
         match projection {
-            RowProjection::NodeId { binding } | RowProjection::Property { binding, .. } => {
-                check(binding)?
-            }
+            RowProjection::Entity { binding, .. }
+            | RowProjection::NodeId { binding }
+            | RowProjection::Property { binding, .. } => check(binding)?,
             RowProjection::Aggregate { expression, .. } => match expression {
                 RowExpression::NodeId { binding } | RowExpression::Property { binding, .. } => {
                     check(binding)?
@@ -3188,9 +3204,9 @@ fn validate_return_bindings(rows: &ParsedRowQuery, visible: &BTreeSet<String>) -
     }
     for sort in &rows.order_by {
         match &sort.expression {
-            RowSortExpression::NodeId { binding } | RowSortExpression::Property { binding, .. } => {
-                check(binding)?
-            }
+            RowSortExpression::ElementId { binding }
+            | RowSortExpression::NodeId { binding }
+            | RowSortExpression::Property { binding, .. } => check(binding)?,
             RowSortExpression::Column { .. } | RowSortExpression::CountAll => {}
         }
     }
@@ -3381,7 +3397,7 @@ fn lower_match_return_rows(
                 optional,
             });
         }
-        if patterns.is_empty() {
+        if patterns.is_empty() && !match_clauses.is_empty() {
             return unsupported(
                 QueryFailureReason::Pattern,
                 "MATCH requires at least one executable row pattern",
@@ -3430,6 +3446,33 @@ fn lower_match_return_rows(
                 continue;
             }
 
+            if is_instance(expression, AstKind::Identifier) {
+                let binding = identifier_name(expression)?;
+                columns.push(QueryColumn::new(projection_column_name(
+                    projection, &binding,
+                )?));
+                projections.push(RowProjection::Entity {
+                    binding,
+                    function: RowEntityFunction::Value,
+                });
+                continue;
+            }
+            if let Some((binding, function)) = entity_function_binding(expression)? {
+                columns.push(QueryColumn::new(projection_column_name(
+                    projection,
+                    format!(
+                        "{}({binding})",
+                        match function {
+                            RowEntityFunction::ElementId => "elementId",
+                            RowEntityFunction::Labels => "labels",
+                            RowEntityFunction::Id => "id",
+                            RowEntityFunction::Value => unreachable!(),
+                        }
+                    ),
+                )?));
+                projections.push(RowProjection::Entity { binding, function });
+                continue;
+            }
             if let Some(binding) = node_id_expression_binding(expression)? {
                 columns.push(QueryColumn::new(projection_column_name(
                     projection,
@@ -3439,9 +3482,13 @@ fn lower_match_return_rows(
                 continue;
             }
             if let Some(literal) = literal_projection_value(expression, parameters)? {
+                let fallback = if is_instance(expression, AstKind::Parameter) {
+                    format!("${}", parameter_name(expression)?)
+                } else {
+                    literal_projection_fallback_name(&literal)
+                };
                 columns.push(QueryColumn::new(projection_column_name(
-                    projection,
-                    literal_projection_fallback_name(&literal),
+                    projection, fallback,
                 )?));
                 projections.push(RowProjection::Literal(literal));
                 continue;
@@ -4165,6 +4212,13 @@ fn row_projection_matches_sort_expression(
     expression: &RowSortExpression,
 ) -> bool {
     match (projection, expression) {
+        (
+            RowProjection::Entity {
+                binding: left,
+                function: RowEntityFunction::ElementId,
+            },
+            RowSortExpression::ElementId { binding: right },
+        ) => left == right,
         (RowProjection::NodeId { binding: left }, RowSortExpression::NodeId { binding: right }) => {
             left == right
         }
@@ -4184,6 +4238,19 @@ fn row_projection_matches_sort_expression(
 }
 
 fn lower_sort_expression(expression: *const AstNode) -> Result<RowSortExpression> {
+    if let Some((binding, function)) = entity_function_binding(expression)? {
+        if function == RowEntityFunction::ElementId {
+            return Ok(RowSortExpression::ElementId { binding });
+        }
+        if function == RowEntityFunction::Id {
+            return Ok(RowSortExpression::NodeId { binding });
+        }
+        return unsupported(
+            QueryFailureReason::OrderWindow,
+            "ORDER BY labels is not supported",
+        );
+    }
+
     if is_count_star(expression)? {
         return Ok(RowSortExpression::CountAll);
     }
@@ -5382,6 +5449,50 @@ fn is_count_star(expression: *const AstNode) -> Result<bool> {
     }
 }
 
+fn entity_function_binding(
+    expression: *const AstNode,
+) -> Result<Option<(String, RowEntityFunction)>> {
+    unsafe {
+        if !is_instance(expression, AstKind::ApplyOperator) {
+            return Ok(None);
+        }
+        let function = function_name(checked_node(sys::cypher_ast_apply_operator_get_func_name(
+            expression,
+        ))?)?;
+        if !["elementid", "labels", "id"]
+            .iter()
+            .any(|name| function.eq_ignore_ascii_case(name))
+        {
+            return Ok(None);
+        }
+        if sys::cypher_ast_apply_operator_get_distinct(expression)
+            || sys::cypher_ast_apply_operator_narguments(expression) != 1
+        {
+            return unsupported(
+                QueryFailureReason::Return,
+                "entity functions require one binding",
+            );
+        }
+        let argument = checked_node(sys::cypher_ast_apply_operator_get_argument(expression, 0))?;
+        if !is_instance(argument, AstKind::Identifier) {
+            return unsupported(
+                QueryFailureReason::Return,
+                "entity functions require a binding",
+            );
+        }
+        Ok(Some((
+            identifier_name(argument)?,
+            if function.eq_ignore_ascii_case("elementId") {
+                RowEntityFunction::ElementId
+            } else if function.eq_ignore_ascii_case("labels") {
+                RowEntityFunction::Labels
+            } else {
+                RowEntityFunction::Id
+            },
+        )))
+    }
+}
+
 fn node_id_expression_binding(expression: *const AstNode) -> Result<Option<String>> {
     match property_expression_binding(expression)? {
         Some((binding, property)) if property.eq_ignore_ascii_case("id") => Ok(Some(binding)),
@@ -5410,8 +5521,8 @@ fn property_expression_binding(expression: *const AstNode) -> Result<Option<(Str
 ///
 /// Returns `None` when the expression is not a literal at all, so the caller
 /// falls through to its existing error. `Some(None)` is a projected NULL.
-/// Parameters are deliberately excluded — `$x AS col` stays unsupported rather
-/// than quietly becoming a constant column.
+/// Scalar parameters are resolved with the request's parameter map, like
+/// parameterized property predicates.
 fn literal_projection_value(
     expression: *const AstNode,
     parameters: &BTreeMap<String, VertexPropertyValue>,
@@ -5420,6 +5531,7 @@ fn literal_projection_value(
         return Ok(Some(None));
     }
     let literal = is_instance(expression, AstKind::String)
+        || is_instance(expression, AstKind::Parameter)
         || is_instance(expression, AstKind::Integer)
         || is_instance(expression, AstKind::Float)
         || is_instance(expression, AstKind::True)
@@ -5650,5 +5762,27 @@ fn parse_error(reason: impl Into<String>) -> GraphError {
     GraphError::QueryParse {
         dialect: "OpenCypher",
         reason: reason.into(),
+    }
+}
+
+#[cfg(test)]
+mod metadata_access_tests {
+    use super::*;
+
+    #[test]
+    fn metadata_calls_are_read_only_and_validate_the_entire_statement() {
+        for query in [
+            "CALL db.labels()",
+            "CALL db.relationshipTypes() YIELD relationshipType RETURN relationshipType ORDER BY relationshipType",
+        ] {
+            assert!(matches!(classify_opencypher_query_access(query), Ok(OpenCypherQueryAccess::Read)));
+        }
+        for query in [
+            "CALL db.labels() YIELD label RETURN label ORDER BY label DESC",
+            "CALL db.labels() YIELD label RETURN label ORDER BY label CREATE (n)",
+            "CALL db.labels() CREATE (n)",
+        ] {
+            assert!(classify_opencypher_query_access(query).is_err(), "{query}");
+        }
     }
 }

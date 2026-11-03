@@ -322,6 +322,8 @@ enum HttpQueryValue {
     Boolean(bool),
     String(String),
     List(Vec<HttpQueryValue>),
+    Node(crate::QueryPathNode),
+    Relationship(crate::QueryPathRelationship),
     Path(QueryPath),
 }
 
@@ -780,6 +782,10 @@ fn http_query_value(value: &QueryValue) -> Result<HttpQueryValue> {
             .map(http_query_value)
             .collect::<Result<Vec<_>>>()
             .map(HttpQueryValue::List),
+        QueryValue::Node(node) => Ok(HttpQueryValue::Node(node.as_ref().clone())),
+        QueryValue::Relationship(relationship) => {
+            Ok(HttpQueryValue::Relationship(relationship.as_ref().clone()))
+        }
         QueryValue::Path(path) => Ok(HttpQueryValue::Path(path.as_ref().clone())),
     }
 }
@@ -971,5 +977,46 @@ fn http_io_error(operation: &'static str, error: std::io::Error) -> GraphError {
     GraphError::CorruptValue {
         key: format!("client/http/{operation}"),
         reason: error.to_string(),
+    }
+}
+
+#[cfg(test)]
+mod entity_http_tests {
+    use super::*;
+
+    #[test]
+    fn entities_keep_typed_native_payloads_in_lists() {
+        let node = crate::QueryPathNode {
+            id: 9007199254740993,
+            labels: vec!["Person".into()],
+            properties: BTreeMap::from([(
+                "name".into(),
+                VertexPropertyValue::String("Ada".into()),
+            )]),
+        };
+        let relationship = crate::QueryPathRelationship {
+            id: None,
+            edge_type: "KNOWS".into(),
+            src: node.id,
+            dst: 2,
+            properties: BTreeMap::new(),
+        };
+        let values = QueryValue::List(vec![
+            QueryValue::Node(Box::new(node.clone())),
+            QueryValue::Relationship(Box::new(relationship.clone())),
+        ]);
+        let encoded = serde_json::to_value(http_query_value(&values).unwrap()).unwrap();
+        assert_eq!(encoded["type"], "list");
+        assert_eq!(encoded["value"][0]["type"], "node");
+        assert_eq!(
+            encoded["value"][0]["value"],
+            serde_json::to_value(node).unwrap()
+        );
+        assert_eq!(encoded["value"][1]["type"], "relationship");
+        assert_eq!(
+            encoded["value"][1]["value"],
+            serde_json::to_value(relationship).unwrap()
+        );
+        assert_eq!(encoded["value"][0]["value"]["id"], 9007199254740993_u64);
     }
 }

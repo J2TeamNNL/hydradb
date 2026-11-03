@@ -1,9 +1,12 @@
 use boltr::error::BoltError;
-use boltr::types::{BoltDict, BoltNode, BoltPath, BoltUnboundRelationship, BoltValue};
+use boltr::types::{
+    BoltDict, BoltNode, BoltPath, BoltRelationship, BoltUnboundRelationship, BoltValue,
+};
 
 use super::{ClientBookmark, ClientQueryTarget};
 use crate::{
-    GraphError, QueryFloat, QueryParameterValue, QueryPath, QueryValue, VertexPropertyValue,
+    GraphError, QueryFloat, QueryParameterValue, QueryPath, QueryPathNode, QueryPathRelationship,
+    QueryValue, VertexPropertyValue,
 };
 
 const MAX_QUERY_PARAMETER_DEPTH: usize = 16;
@@ -109,8 +112,42 @@ pub(super) fn query_value_to_bolt(value: &QueryValue) -> std::result::Result<Bol
             .map(query_value_to_bolt)
             .collect::<std::result::Result<Vec<_>, _>>()
             .map(BoltValue::List),
+        QueryValue::Node(node) => query_node_to_bolt(node).map(BoltValue::Node),
+        QueryValue::Relationship(relationship) => {
+            query_relationship_to_bolt(relationship).map(BoltValue::Relationship)
+        }
         QueryValue::Path(path) => query_path_to_bolt(path).map(BoltValue::Path),
     }
+}
+
+fn query_node_to_bolt(node: &QueryPathNode) -> std::result::Result<BoltNode, BoltError> {
+    Ok(BoltNode {
+        id: i64::try_from(node.id).map_err(|_| bolt_integer_overflow(node.id))?,
+        labels: node.labels.clone(),
+        properties: property_map_to_bolt(&node.properties)?,
+        element_id: node.id.to_string(),
+    })
+}
+
+fn query_relationship_to_bolt(
+    relationship: &QueryPathRelationship,
+) -> std::result::Result<BoltRelationship, BoltError> {
+    Ok(BoltRelationship {
+        // Structural edges have no supported legacy numeric ID. Bolt 5 clients
+        // use the canonical element ID to distinguish these relationships.
+        id: relationship.id.map_or(Ok(-1), |id| {
+            i64::try_from(id).map_err(|_| bolt_integer_overflow(id))
+        })?,
+        start_node_id: i64::try_from(relationship.src)
+            .map_err(|_| bolt_integer_overflow(relationship.src))?,
+        end_node_id: i64::try_from(relationship.dst)
+            .map_err(|_| bolt_integer_overflow(relationship.dst))?,
+        rel_type: relationship.edge_type.clone(),
+        properties: property_map_to_bolt(&relationship.properties)?,
+        element_id: relationship.element_id(),
+        start_element_id: relationship.src.to_string(),
+        end_element_id: relationship.dst.to_string(),
+    })
 }
 
 fn query_path_to_bolt(path: &QueryPath) -> std::result::Result<BoltPath, BoltError> {
@@ -122,15 +159,7 @@ fn query_path_to_bolt(path: &QueryPath) -> std::result::Result<BoltPath, BoltErr
     let nodes = path
         .nodes
         .iter()
-        .map(|node| {
-            let id = i64::try_from(node.id).map_err(|_| bolt_integer_overflow(node.id))?;
-            Ok(BoltNode {
-                id,
-                labels: node.labels.clone(),
-                properties: property_map_to_bolt(&node.properties)?,
-                element_id: node.id.to_string(),
-            })
-        })
+        .map(query_node_to_bolt)
         .collect::<std::result::Result<Vec<_>, BoltError>>()?;
     let relationships = path
         .relationships
@@ -149,15 +178,7 @@ fn query_path_to_bolt(path: &QueryPath) -> std::result::Result<BoltPath, BoltErr
                 id,
                 rel_type: relationship.edge_type.clone(),
                 properties: property_map_to_bolt(&relationship.properties)?,
-                element_id: relationship.id.map_or_else(
-                    || {
-                        format!(
-                            "structural:{}:{}:{}",
-                            relationship.edge_type, relationship.src, relationship.dst
-                        )
-                    },
-                    |id| id.to_string(),
-                ),
+                element_id: relationship.element_id(),
             })
         })
         .collect::<std::result::Result<Vec<_>, BoltError>>()?;
@@ -285,5 +306,105 @@ pub(super) fn graph_error_to_bolt(error: GraphError) -> BoltError {
             tracing::warn!(target: "hydradb", error = %error, "Bolt suppressed internal graph error");
             BoltError::Backend("internal query execution error".to_string())
         }
+    }
+}
+
+#[cfg(test)]
+mod entity_value_tests {
+    use super::*;
+    use std::collections::BTreeMap;
+
+    fn relationship(id: Option<u64>, dst: u64) -> QueryPathRelationship {
+        QueryPathRelationship {
+            id,
+            edge_type: "KNOWS".into(),
+            src: 9007199254740993,
+            dst,
+            properties: BTreeMap::from([(
+                "weight".into(),
+                VertexPropertyValue::Integer(9007199254740993),
+            )]),
+        }
+    }
+
+    #[test]
+    fn standalone_entities_preserve_properties_and_nested_lists() {
+        let node = QueryPathNode {
+            id: 9007199254740993,
+            labels: vec!["Person".into(), "Author".into()],
+            properties: BTreeMap::from([(
+                "name".into(),
+                VertexPropertyValue::String("Ada".into()),
+            )]),
+        };
+        let value = QueryValue::List(vec![QueryValue::List(vec![QueryValue::Node(Box::new(
+            node.clone(),
+        ))])]);
+        let BoltValue::List(outer) = query_value_to_bolt(&value).unwrap() else {
+            panic!("list")
+        };
+        let BoltValue::List(inner) = &outer[0] else {
+            panic!("nested list")
+        };
+        let BoltValue::Node(encoded) = &inner[0] else {
+            panic!("node")
+        };
+        assert_eq!(encoded.id, 9007199254740993);
+        assert_eq!(encoded.element_id, "9007199254740993");
+        assert_eq!(encoded.labels, node.labels);
+        assert!(
+            matches!(encoded.properties.get("name"), Some(BoltValue::String(value)) if value == "Ada")
+        );
+    }
+
+    #[test]
+    fn relationships_have_canonical_identity_and_exact_endpoints() {
+        for id in [None, Some(41), Some(42)] {
+            let relation = relationship(id, 7);
+            let BoltValue::Relationship(encoded) =
+                query_value_to_bolt(&QueryValue::Relationship(Box::new(relation.clone()))).unwrap()
+            else {
+                panic!("relationship")
+            };
+            assert_eq!(encoded.id, id.map_or(-1, |id| id as i64));
+            assert_eq!(encoded.element_id, relation.element_id());
+            assert_eq!(encoded.rel_type, "KNOWS");
+            assert_eq!(encoded.start_node_id, 9007199254740993);
+            assert_eq!(encoded.end_node_id, 7);
+            assert_eq!(encoded.start_element_id, "9007199254740993");
+            assert_eq!(encoded.end_element_id, "7");
+            assert!(matches!(
+                encoded.properties.get("weight"),
+                Some(BoltValue::Integer(9007199254740993))
+            ));
+        }
+        assert_ne!(
+            relationship(None, 7).element_id(),
+            relationship(None, 8).element_id()
+        );
+        assert_ne!(
+            relationship(Some(41), 7).element_id(),
+            relationship(Some(42), 7).element_id()
+        );
+    }
+
+    #[test]
+    fn entity_integer_overflow_is_an_explicit_error() {
+        let mut relation = relationship(Some(u64::MAX), 7);
+        assert!(query_relationship_to_bolt(&relation).is_err());
+        relation.id = Some(1);
+        relation.dst = u64::MAX;
+        assert!(query_relationship_to_bolt(&relation).is_err());
+        relation.dst = 7;
+        relation
+            .properties
+            .insert("weight".into(), VertexPropertyValue::Integer(u64::MAX));
+        assert!(query_relationship_to_bolt(&relation).is_err());
+        let node = QueryPathNode {
+            id: u64::MAX,
+            labels: vec![],
+            properties: BTreeMap::new(),
+        };
+        assert!(query_node_to_bolt(&node).is_err());
     }
 }

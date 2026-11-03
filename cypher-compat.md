@@ -19,7 +19,7 @@ accepted.
 | `MATCH` | Yes, one or more path patterns, directed, one relationship type each |
 | `OPTIONAL MATCH` | Yes for reads, rejected in mutations |
 | `WHERE` | Yes, boolean combinations of property comparisons |
-| `RETURN` | Yes, property projections and aggregates, with alias, `DISTINCT`, `ORDER BY`, `SKIP`, `LIMIT` |
+| `RETURN` | Yes, entities, properties, scalar literals/parameters and aggregates, with alias, `DISTINCT`, `ORDER BY`, `SKIP`, `LIMIT` |
 | `WITH` | Pass-through only, no aliases and no filtering |
 | `CREATE` | Yes, one or more relationship paths |
 | `MERGE` | Yes, matched on id, no `ON CREATE` or `ON MATCH` |
@@ -29,6 +29,7 @@ accepted.
 | `UNWIND` | Yes, as a batch form driven by a parameter |
 | `UNION`, `UNION ALL` | Yes for reads, arms must project the same columns |
 | `CALL algo.*` | Yes, three native path procedures |
+| `CALL db.labels()`, `CALL db.relationshipTypes()` | Yes, live names from the selected cell |
 | `CREATE UNIQUE` | No |
 | `RETURN *` | No |
 
@@ -82,8 +83,29 @@ property comparisons.
 
 ### RETURN
 
-Projections are `<binding>.<property>` or an aggregate. `RETURN *` is not
+Projections include whole nodes and relationships, `<binding>.<property>`,
+scalar literals and parameters, or an aggregate. A standalone `RETURN 1` or
+`RETURN $value AS value` returns one row without a `MATCH`. `RETURN *` is not
 executable, so name what you want.
+
+```cypher
+MATCH (n:Person) RETURN n ORDER BY elementId(n) SKIP 0 LIMIT 100
+MATCH ()-[r:FOLLOWS]->() RETURN r, elementId(r)
+MATCH (n:Person) RETURN labels(n), elementId(n)
+RETURN 1
+```
+
+Entity results contain the real labels, properties and endpoint identities
+at the query snapshot. Bolt returns native node and relationship values;
+HTTP uses typed `node` and `relationship` values. `elementId()` returns an
+opaque string. Identified relationships use their stored identity, while a
+structural relationship uses its type and endpoints. Parallel identified
+relationships keep different identities. A structural relationship has no
+legacy numeric relationship id; use `elementId(r)` rather than `id(r)`.
+
+Entity matching uses canonical node records or matched relationships rather
+than inventing a node from an id. Existing scalar id-only seek behavior is
+unchanged; see [identity and idempotency](USING-HYDRADB.md#identity-and-idempotency).
 
 Aggregates: `count`, `sum`, `avg`, `collect`. `count(*)` is supported.
 `DISTINCT` inside an aggregate argument is not, and neither is `count(DISTINCT *)`.
@@ -205,6 +227,24 @@ API carries scalar parameters only, so `execute_cypher` on a shard rejects every
 about batching, which is worth knowing before you spend time on the query
 itself: the statement is fine, the entry point is wrong.
 
+## Metadata procedures
+
+```cypher
+CALL db.labels() YIELD label RETURN label ORDER BY label
+CALL db.relationshipTypes() YIELD relationshipType RETURN relationshipType ORDER BY relationshipType
+```
+
+The calls also work without `YIELD` and `RETURN`. Their single output columns
+are `label` and `relationshipType`. `ORDER BY` on that column supports `ASC`;
+aliases, filters, `DESC` and `LIMIT` are rejected.
+
+Names come from live transactional indexes in the selected graph and cell,
+not sampled planner statistics. Empty cells return no names. Deleted types
+with only zero degree counters are excluded. Snapshot, scan, row, byte,
+timeout and cancellation limits apply; exceeding a limit fails the call
+instead of returning an incomplete catalog. `db.info`, `SHOW DATABASES`,
+`SHOW INDEXES` and schema-property procedures remain unsupported.
+
 ## Path procedures
 
 Three native procedures, each called with a config map, a `YIELD`, and a
@@ -256,7 +296,7 @@ accepted as `UNWIND` input, and only through the client transport.
 
 Rejected at parse time, with the reason in the error:
 
-- `RETURN *`, and projections other than `<binding>.<property>` or an aggregate
+- `RETURN *`, and arbitrary expression/function projections beyond those listed above
 - `CREATE UNIQUE`, and `ON CREATE` or `ON MATCH` on `MERGE`
 - Undirected relationship patterns, and patterns with more than one type
 - Unbounded variable-length traversal, `*` or `*1..`

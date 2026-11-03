@@ -33,6 +33,15 @@ pub struct QueryPathRelationship {
     pub properties: BTreeMap<String, VertexPropertyValue>,
 }
 
+impl QueryPathRelationship {
+    pub fn element_id(&self) -> String {
+        self.id.map_or_else(
+            || format!("structural:{}:{}:{}", self.edge_type, self.src, self.dst),
+            |id| id.to_string(),
+        )
+    }
+}
+
 #[cfg_attr(
     feature = "query-transport",
     derive(serde::Deserialize, serde::Serialize)
@@ -866,6 +875,8 @@ pub enum QueryValue {
     Float(QueryFloat),
     Property(VertexPropertyValue),
     List(Vec<QueryValue>),
+    Node(Box<QueryPathNode>),
+    Relationship(Box<QueryPathRelationship>),
     Path(Box<QueryPath>),
 }
 
@@ -904,6 +915,10 @@ impl QueryValue {
             Self::List(values) => values.iter().fold(inline, |total, value| {
                 total.saturating_add(value.estimated_resident_bytes())
             }),
+            Self::Node(node) => inline.saturating_add(node.estimated_resident_bytes()),
+            Self::Relationship(relationship) => {
+                inline.saturating_add(relationship.estimated_resident_bytes())
+            }
             Self::Path(path) => path.estimated_resident_bytes(),
             Self::Null
             | Self::VertexId(_)
@@ -919,19 +934,34 @@ impl QueryValue {
 impl QueryPath {
     fn estimated_resident_bytes(&self) -> u64 {
         let node_bytes = self.nodes.iter().fold(0_u64, |total, node| {
-            total
-                .saturating_add(std::mem::size_of::<QueryPathNode>() as u64)
-                .saturating_add(node.labels.iter().map(|label| label.len() as u64).sum())
-                .saturating_add(property_map_resident_bytes(&node.properties))
+            total.saturating_add(node.estimated_resident_bytes())
         });
         self.relationships
             .iter()
             .fold(node_bytes, |total, relationship| {
-                total
-                    .saturating_add(std::mem::size_of::<QueryPathRelationship>() as u64)
-                    .saturating_add(relationship.edge_type.len() as u64)
-                    .saturating_add(property_map_resident_bytes(&relationship.properties))
+                total.saturating_add(relationship.estimated_resident_bytes())
             })
+    }
+}
+
+#[cfg(feature = "opencypher")]
+impl QueryPathNode {
+    fn estimated_resident_bytes(&self) -> u64 {
+        self.labels
+            .iter()
+            .fold(std::mem::size_of::<Self>() as u64, |total, label| {
+                total.saturating_add(label.len() as u64)
+            })
+            .saturating_add(property_map_resident_bytes(&self.properties))
+    }
+}
+
+#[cfg(feature = "opencypher")]
+impl QueryPathRelationship {
+    fn estimated_resident_bytes(&self) -> u64 {
+        (std::mem::size_of::<Self>() as u64)
+            .saturating_add(self.edge_type.len() as u64)
+            .saturating_add(property_map_resident_bytes(&self.properties))
     }
 }
 
@@ -1668,4 +1698,48 @@ fn validate_query_edge_metadata(metadata: &EdgeMetadata) -> Result<()> {
         validate_component("property", property)?;
     }
     Ok(())
+}
+
+#[cfg(all(test, feature = "opencypher"))]
+mod entity_memory_tests {
+    use super::*;
+
+    #[test]
+    fn entities_and_nested_lists_account_for_owned_payloads() {
+        let node = QueryPathNode {
+            id: 1,
+            labels: vec!["Person".into()],
+            properties: BTreeMap::from([(
+                "name".into(),
+                VertexPropertyValue::String("Ada".into()),
+            )]),
+        };
+        let node_bytes =
+            (std::mem::size_of::<QueryValue>() + std::mem::size_of::<QueryPathNode>() + 6 + 4 + 3)
+                as u64;
+        assert_eq!(
+            QueryValue::Node(Box::new(node.clone())).estimated_resident_bytes(),
+            node_bytes
+        );
+        let relation = QueryPathRelationship {
+            id: None,
+            edge_type: "KNOWS".into(),
+            src: 1,
+            dst: 2,
+            properties: node.properties.clone(),
+        };
+        let relation_bytes = (std::mem::size_of::<QueryValue>()
+            + std::mem::size_of::<QueryPathRelationship>()
+            + 5
+            + 4
+            + 3) as u64;
+        let value = QueryValue::List(vec![
+            QueryValue::Node(Box::new(node)),
+            QueryValue::Relationship(Box::new(relation)),
+        ]);
+        assert_eq!(
+            value.estimated_resident_bytes(),
+            std::mem::size_of::<QueryValue>() as u64 + node_bytes + relation_bytes
+        );
+    }
 }

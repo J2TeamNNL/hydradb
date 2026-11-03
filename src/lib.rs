@@ -177,9 +177,9 @@ pub use query::opencypher::{
     parse_opencypher_mutation_query_with_parameters, parse_opencypher_row_query,
     parse_opencypher_row_query_with_list_parameters, parse_opencypher_row_query_with_parameters,
     EdgeDirection, ListParameters, MutationReturn, ParsedMutationQuery, ParsedRowQuery,
-    RowAggregateFunction, RowComparisonOp, RowEdgePattern, RowExpression, RowMatchGroup,
-    RowMutationAction, RowNodePattern, RowPattern, RowPredicate, RowProjection, RowSort,
-    RowSortExpression,
+    RowAggregateFunction, RowComparisonOp, RowEdgePattern, RowEntityFunction, RowExpression,
+    RowMatchGroup, RowMutationAction, RowNodePattern, RowPattern, RowPredicate, RowProjection,
+    RowSort, RowSortExpression,
 };
 pub use sparse_kernel::SparseKernelBackend;
 

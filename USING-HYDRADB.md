@@ -104,6 +104,23 @@ console.log(result.records.map((r) => r.get('id')))
 await session.close(); await driver.close()
 ```
 
+### Entity-aware Bolt clients
+
+Use `RETURN n` for a node or `RETURN r` for a relationship. The driver receives
+native graph entities with labels or relationship type, properties and
+endpoint element ids. Use `elementId(n)` or `elementId(r)` for opaque identity
+strings, including structural relationships without a numeric id.
+
+`CALL db.labels()` and `CALL db.relationshipTypes()` list live names in the
+selected database's cell. They respect the same authorization and query
+limits as other reads. See [Cypher support](cypher-compat.md#metadata-procedures)
+for their accepted suffixes and completeness rules. Clients can sample full
+entities to discover property names; `keys`/`UNWIND` schema discovery and
+`db.info()` are not supported.
+
+Bolt access mode is a routing hint, not an authorization boundary. Configure
+scope grants for access control; do not treat `mode=r` as a security guarantee.
+
 ### HTTP query API
 
 ```bash

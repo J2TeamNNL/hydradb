@@ -238,3 +238,6 @@ ulid = { workspace = true }
 # `otlp` feature below, and nothing enables it implicitly.
 hydradb-telemetry = { path = "crates/telemetry", optional = true }
 
+[dev-dependencies]
+tempfile = { workspace = true }
+

@@ -306,9 +306,18 @@ impl GraphShard {
             error.operation = tracing::field::Empty,
             hydradb.sampling.tail_keep = tracing::field::Empty,
         );
-        let result = Box::pin(self.execute_native_procedure_rows_snapshot(context, procedure))
-            .instrument(span.clone())
-            .await;
+        let metadata_budget = matches!(&procedure, NativeProcedure::Metadata(_)).then(|| {
+            QueryBudget::new(
+                context.max_runtime_ms.or(self.limits.max_query_runtime_ms),
+                context.cancellation_token.clone(),
+            )
+        });
+        let execution = Box::pin(self.execute_native_procedure_rows_snapshot(context, procedure))
+            .instrument(span.clone());
+        let result = match metadata_budget {
+            Some(budget) => budget.read_only_io("metadata_query", execution).await,
+            None => execution.await,
+        };
         self.operation_metrics
             .query_rows_latency
             .record(started.elapsed());
@@ -373,6 +382,10 @@ impl GraphShard {
         procedure: NativeProcedure,
     ) -> Result<QueryResultSet> {
         match procedure {
+            NativeProcedure::Metadata(procedure) => {
+                self.execute_native_metadata_rows_inner(context, procedure)
+                    .await
+            }
             NativeProcedure::Path(procedure) => {
                 Box::pin(self.execute_native_path_rows_inner(context, *procedure)).await
             }

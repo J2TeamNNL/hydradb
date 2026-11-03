@@ -83,6 +83,7 @@ struct ParsedNativePathCall {
 pub(crate) enum NativeProcedure {
     Path(Box<NativePathProcedure>),
     Degree(NativeDegreeProcedure),
+    Metadata(NativeMetadataProcedure),
 }
 
 impl NativeProcedure {
@@ -90,8 +91,68 @@ impl NativeProcedure {
         match self {
             Self::Path(procedure) => procedure.kind.procedure_name(),
             Self::Degree(_) => NATIVE_DEGREE_PROCEDURE_NAME,
+            Self::Metadata(procedure) => procedure.name(),
         }
     }
+}
+
+/// Exact cell-local names from transactional label indexes and degree counters.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) enum NativeMetadataProcedure {
+    Labels,
+    RelationshipTypes,
+}
+
+impl NativeMetadataProcedure {
+    pub(crate) fn name(self) -> &'static str {
+        match self {
+            Self::Labels => "db.labels",
+            Self::RelationshipTypes => "db.relationshipTypes",
+        }
+    }
+
+    pub(crate) fn column(self) -> &'static str {
+        match self {
+            Self::Labels => "label",
+            Self::RelationshipTypes => "relationshipType",
+        }
+    }
+}
+
+/// Deliberately bounded grammar: no filters, aliases, LIMIT or query suffixes.
+/// Reject unsupported syntax instead of presenting a partial catalog as complete.
+pub(crate) fn parse_native_metadata_call(query: &str) -> Result<Option<NativeMetadataProcedure>> {
+    let prefix = query.trim_start().to_ascii_lowercase();
+    if !prefix.starts_with("call") || !prefix[4..].trim_start().starts_with("db.") {
+        return Ok(None);
+    }
+    let mut parser = Parser::new(query)?;
+    parser.keyword("CALL")?;
+    parser.identifier_eq("db")?;
+    parser.token(Token::Dot)?;
+    let procedure = match parser.identifier()?.as_str() {
+        name if name.eq_ignore_ascii_case("labels") => NativeMetadataProcedure::Labels,
+        name if name.eq_ignore_ascii_case("relationshipTypes") => {
+            NativeMetadataProcedure::RelationshipTypes
+        }
+        _ => return Ok(None),
+    };
+    parser.token(Token::LeftParen)?;
+    parser.token(Token::RightParen)?;
+    if parser.optional_keyword("YIELD") {
+        parser.token(Token::Identifier(procedure.column().to_string()))?;
+        if parser.optional_keyword("RETURN") {
+            parser.token(Token::Identifier(procedure.column().to_string()))?;
+            if parser.optional_keyword("ORDER") {
+                parser.keyword("BY")?;
+                parser.token(Token::Identifier(procedure.column().to_string()))?;
+                parser.optional_keyword("ASC");
+            }
+        }
+    }
+    parser.optional(Token::Semicolon);
+    parser.end()?;
+    Ok(Some(procedure))
 }
 
 const NATIVE_DEGREE_PROCEDURE_NAME: &str = "algo.degree";
@@ -192,6 +253,9 @@ pub(crate) fn parse_native_procedure(
     parameters: &BTreeMap<String, VertexPropertyValue>,
     max_traversal_hops: u8,
 ) -> Result<Option<NativeProcedure>> {
+    if let Some(metadata) = parse_native_metadata_call(query)? {
+        return Ok(Some(NativeProcedure::Metadata(metadata)));
+    }
     if let Some(degree) = parse_native_degree_procedure(query, parameters)? {
         return Ok(Some(NativeProcedure::Degree(degree)));
     }
@@ -205,6 +269,9 @@ pub(crate) fn parse_native_procedure(
 /// can send them with the RUN response.
 #[cfg(feature = "client-api")]
 pub(crate) fn parse_native_procedure_columns(query: &str) -> Result<Option<Vec<QueryColumn>>> {
+    if let Some(metadata) = parse_native_metadata_call(query)? {
+        return Ok(Some(vec![QueryColumn::new(metadata.column())]));
+    }
     if let Some(parsed) = parse_native_degree_call(query)? {
         return Ok(Some(
             parsed
@@ -1123,4 +1190,51 @@ fn path_parse_error<T>(reason: impl Into<String>) -> Result<T> {
         dialect: "OpenCypher",
         reason: reason.into(),
     })
+}
+
+#[cfg(test)]
+mod metadata_parser_tests {
+    use super::*;
+
+    #[test]
+    fn metadata_dispatch_and_columns_are_exact() {
+        for (query, expected) in [
+            (
+                "CALL db.labels() YIELD label RETURN label ORDER BY label",
+                NativeMetadataProcedure::Labels,
+            ),
+            (
+                "call db.relationshipTypes() YIELD relationshipType RETURN relationshipType;",
+                NativeMetadataProcedure::RelationshipTypes,
+            ),
+        ] {
+            assert_eq!(
+                parse_native_procedure(query, &BTreeMap::new(), 8).unwrap(),
+                Some(NativeProcedure::Metadata(expected))
+            );
+            #[cfg(feature = "client-api")]
+            assert_eq!(
+                parse_native_procedure_columns(query).unwrap(),
+                Some(vec![QueryColumn::new(expected.column())])
+            );
+        }
+    }
+
+    #[test]
+    fn metadata_rejects_partial_or_mutating_suffixes() {
+        for query in [
+            "CALL db.labels() YIELD label LIMIT 1",
+            "CALL db.labels() CREATE (n)",
+            "CALL db.labels(1)",
+            "CALL db.labels() YIELD other",
+            "CALL db.labels() YIELD LABEL",
+            "CALL db.labels() YIELD label RETURN label AS name",
+        ] {
+            assert!(parse_native_metadata_call(query).is_err(), "{query}");
+        }
+        assert_eq!(
+            parse_native_metadata_call("CALL db.propertyKeys()").unwrap(),
+            None
+        );
+    }
 }

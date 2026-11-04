@@ -12919,10 +12919,18 @@ fn sort_keys_for_row(
             RowSortExpression::ElementId { binding } => {
                 project_entity_value(binding_row, binding, &RowEntityFunction::ElementId)?
             }
-            RowSortExpression::NodeId { binding } => match binding_row.get_optional(binding)? {
-                Some(value) => QueryValue::VertexId(value),
-                None => QueryValue::Null,
-            },
+            RowSortExpression::NodeId { binding } => {
+                if binding_row.relationships.contains_key(binding)
+                    || binding_row.null_relationships.contains(binding)
+                {
+                    project_entity_value(binding_row, binding, &RowEntityFunction::Id)?
+                } else {
+                    match binding_row.get_optional(binding)? {
+                        Some(value) => QueryValue::VertexId(value),
+                        None => QueryValue::Null,
+                    }
+                }
+            }
             RowSortExpression::Property { binding, property } => {
                 match binding_property(binding_row, binding, property)? {
                     Some(value) => QueryValue::Property(value),
@@ -13469,6 +13477,121 @@ mod entity_row_tests {
             .len(),
             1
         );
+        shard.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn distinct_numeric_node_ids_remain_projected_sort_keys() {
+        let (_directory, shard) = local_shard().await;
+        for id in [2, 1] {
+            shard
+                .set_vertex_metadata("one", id, metadata("Reader"))
+                .await
+                .unwrap();
+        }
+        let result = rows(
+            &shard,
+            "MATCH (n:Person) RETURN DISTINCT id(n) ORDER BY id(n) DESC",
+        )
+        .await;
+        assert_eq!(
+            result
+                .rows
+                .iter()
+                .map(|row| row.values[0].clone())
+                .collect::<Vec<_>>(),
+            vec![QueryValue::VertexId(2), QueryValue::VertexId(1)]
+        );
+        assert!(shard
+            .execute_opencypher_rows(
+                QueryContext::new("one", "unprojected"),
+                "MATCH (n:Person) RETURN DISTINCT n.name ORDER BY id(n)"
+            )
+            .await
+            .is_err());
+        shard.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn numeric_relationship_ids_sort_without_node_bindings() {
+        let (_directory, shard) = local_shard().await;
+        let mutation = |key: &str| EdgeMutation {
+            cell_id: "one".into(),
+            edge_type: "READS".into(),
+            src: 1,
+            dst: 2,
+            idempotency_key: key.into(),
+        };
+        let mut ids = Vec::new();
+        for key in ["first", "second"] {
+            ids.push(
+                shard
+                    .create_relationship_with_full_metadata(
+                        mutation(key),
+                        metadata("A"),
+                        metadata("B"),
+                        EdgeMetadata::default(),
+                    )
+                    .await
+                    .unwrap()
+                    .relationship_id,
+            );
+        }
+        for descending in [false, true] {
+            let direction = if descending { "DESC" } else { "ASC" };
+            let result = rows(
+                &shard,
+                &format!("MATCH ()-[r:READS]->() RETURN r, id(r) ORDER BY id(r) {direction}"),
+            )
+            .await;
+            ids.sort_unstable();
+            if descending {
+                ids.reverse();
+            }
+            assert_eq!(
+                result
+                    .rows
+                    .iter()
+                    .map(|row| row.values[1].clone())
+                    .collect::<Vec<_>>(),
+                ids.iter()
+                    .copied()
+                    .map(QueryValue::VertexId)
+                    .collect::<Vec<_>>()
+            );
+        }
+        let optional = rows(
+            &shard,
+            "MATCH (n:Person) OPTIONAL MATCH (n)-[r:MISSING]->() RETURN r ORDER BY id(r)",
+        )
+        .await;
+        assert_eq!(optional.rows.len(), 2);
+        assert!(optional
+            .rows
+            .iter()
+            .all(|row| row.values == [QueryValue::Null]));
+        shard
+            .set_edge_metadata(
+                "one",
+                "READS",
+                1,
+                2,
+                EdgeMetadata {
+                    properties: [("weight".into(), VertexPropertyValue::Integer(7))]
+                        .into_iter()
+                        .collect(),
+                },
+            )
+            .await
+            .unwrap();
+        let error = shard
+            .execute_opencypher_rows(
+                QueryContext::new("one", "structural-id"),
+                "MATCH ()-[r:READS]->() RETURN r ORDER BY id(r)",
+            )
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("no numeric identity"));
         shard.close().await.unwrap();
     }
 

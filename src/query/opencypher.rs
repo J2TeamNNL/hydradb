@@ -4219,9 +4219,14 @@ fn row_projection_matches_sort_expression(
             },
             RowSortExpression::ElementId { binding: right },
         ) => left == right,
-        (RowProjection::NodeId { binding: left }, RowSortExpression::NodeId { binding: right }) => {
-            left == right
-        }
+        (
+            RowProjection::NodeId { binding: left }
+            | RowProjection::Entity {
+                binding: left,
+                function: RowEntityFunction::Id,
+            },
+            RowSortExpression::NodeId { binding: right },
+        ) => left == right,
         (
             RowProjection::Property {
                 binding: left_binding,
